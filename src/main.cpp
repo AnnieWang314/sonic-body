@@ -1,66 +1,99 @@
 #include <Arduino.h>
+#include <CapacitiveSensor.h>
 
-const uint8_t SENSOR_PINS[] = {10, 13};
-const uint8_t SENSOR_COUNT = sizeof(SENSOR_PINS) / sizeof(SENSOR_PINS[0]);
-const unsigned long SAMPLE_INTERVAL_MS = 2;
-const uint8_t INTEGRATOR_MAX = 12; // 12 * 2 ms = about 24 ms debounce
+// CapacitiveSensor wiring:
+// - Large resistor between pin 2 (send) and pin 4 (receive)
+// - Touch wire connected to pin 4 (receive)
+const uint8_t CAP_SEND_PIN = 2;
+const uint8_t CAP_RECEIVE_PIN = 4;
+CapacitiveSensor capSensor(CAP_SEND_PIN, CAP_RECEIVE_PIN);
 
-bool debouncedState[SENSOR_COUNT];
-uint8_t integrator[SENSOR_COUNT];
-unsigned long lastSampleTime = 0;
+const uint8_t CAP_SAMPLES = 20;
+const uint8_t REQUIRED_CONSECUTIVE_READS = 3;
+const unsigned long READ_INTERVAL_MS = 15;
+const unsigned long DEBUG_PRINT_INTERVAL_MS = 500;
+
+// Thresholds are relative to baseline (delta = raw - baseline).
+const long TOUCH_DELTA_THRESHOLD = 45;
+const long RELEASE_DELTA_THRESHOLD = 20;
+const uint8_t BASELINE_ALPHA_DIV = 16; // Larger = slower baseline tracking
+
+bool isTouched = false;
+uint8_t touchConfidence = 0;
+uint8_t releaseConfidence = 0;
+unsigned long lastReadMs = 0;
+unsigned long lastDebugPrintMs = 0;
+long baseline = 0;
+bool baselineInitialized = false;
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("Touch sensors ready");
+  capSensor.set_CS_AutocaL_Millis(0xFFFFFFFF); // Avoid auto-resetting baseline
 
-  for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
-    pinMode(SENSOR_PINS[i], INPUT_PULLUP);
-
-    bool initial = digitalRead(SENSOR_PINS[i]);
-    debouncedState[i] = initial;
-    integrator[i] = (initial == LOW) ? INTEGRATOR_MAX : 0;
-  }
+  Serial.println("Capacitive touch ready (pins 2 -> 4)");
+  Serial.println("Touch wire on pin 4 to trigger.");
 }
 
 void loop() {
-  unsigned long now = millis();
-  if ((now - lastSampleTime) < SAMPLE_INTERVAL_MS) {
+  unsigned long nowMs = millis();
+  if ((nowMs - lastReadMs) < READ_INTERVAL_MS) {
     return;
   }
-  lastSampleTime = now;
+  lastReadMs = nowMs;
 
-  for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
-    bool raw = digitalRead(SENSOR_PINS[i]);
+  long raw = capSensor.capacitiveSensor(CAP_SAMPLES);
+  if (raw < 0) {
+    // Library returns negative on timeout/error.
+    return;
+  }
 
-    // Integrator debounce: noisy reads move confidence gradually.
-    if (raw == LOW) {
-      if (integrator[i] < INTEGRATOR_MAX) {
-        integrator[i]++;
+  if (!baselineInitialized) {
+    baseline = raw;
+    baselineInitialized = true;
+  }
+
+  long delta = raw - baseline;
+
+  // Track ambient drift only while released.
+  if (!isTouched) {
+    baseline += (raw - baseline) / BASELINE_ALPHA_DIV;
+  }
+
+  if (!isTouched) {
+    if (delta >= TOUCH_DELTA_THRESHOLD) {
+      touchConfidence++;
+      releaseConfidence = 0;
+      if (touchConfidence >= REQUIRED_CONSECUTIVE_READS) {
+        isTouched = true;
+        touchConfidence = 0;
+        Serial.println("Wire touched");
       }
     } else {
-      if (integrator[i] > 0) {
-        integrator[i]--;
+      touchConfidence = 0;
+    }
+  } else {
+    if (delta <= RELEASE_DELTA_THRESHOLD) {
+      releaseConfidence++;
+      touchConfidence = 0;
+      if (releaseConfidence >= REQUIRED_CONSECUTIVE_READS) {
+        isTouched = false;
+        releaseConfidence = 0;
+        Serial.println("Wire released");
       }
+    } else {
+      releaseConfidence = 0;
     }
+  }
 
-    bool newDebounced = debouncedState[i];
-    if (integrator[i] == INTEGRATOR_MAX) {
-      newDebounced = LOW;
-    } else if (integrator[i] == 0) {
-      newDebounced = HIGH;
-    }
-
-    if (newDebounced != debouncedState[i]) {
-      debouncedState[i] = newDebounced;
-      if (newDebounced == LOW) {
-        Serial.print("Sensor ");
-        Serial.print(SENSOR_PINS[i]);
-        Serial.println(" touched");
-      } else {
-        Serial.print("Sensor ");
-        Serial.print(SENSOR_PINS[i]);
-        Serial.println(" released");
-      }
-    }
+  if ((nowMs - lastDebugPrintMs) >= DEBUG_PRINT_INTERVAL_MS) {
+    lastDebugPrintMs = nowMs;
+    Serial.print("Raw: ");
+    Serial.print(raw);
+    Serial.print(" | Baseline: ");
+    Serial.print(baseline);
+    Serial.print(" | Delta: ");
+    Serial.print(delta);
+    Serial.print(" | State: ");
+    Serial.println(isTouched ? "TOUCHED" : "RELEASED");
   }
 }
