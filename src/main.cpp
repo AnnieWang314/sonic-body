@@ -1,37 +1,68 @@
 #include <Arduino.h>
 #include <CapacitiveSensor.h>
 
-// CapacitiveSensor wiring:
-// - Large resistor between pin 2 (send) and pin 4 (receive)
-// - Touch wire connected to pin 4 (receive)
-const uint8_t CAP_SEND_PIN = 2;
-const uint8_t CAP_RECEIVE_PIN = 4;
-CapacitiveSensor capSensor(CAP_SEND_PIN, CAP_RECEIVE_PIN);
+// === Multi-yarn Capacitive Touch Setup ===
+// Use ONE shared send pin for all yarn channels.
+// This is the recommended topology for multi-touch with CapacitiveSensor.
+const uint8_t NUM_YARNS = 3;
 
-const uint8_t CAP_SAMPLES = 20;
-const uint8_t REQUIRED_CONSECUTIVE_READS = 3;
-const unsigned long READ_INTERVAL_MS = 15;
+const uint8_t CAP_SEND_PIN = 2;
+const uint8_t CAP_RECEIVE_PINS[NUM_YARNS] = {3, 7, 9};
+
+// Create CapacitiveSensor objects for all yarns (shared send pin).
+CapacitiveSensor capSensors[NUM_YARNS] = {
+    CapacitiveSensor(CAP_SEND_PIN, CAP_RECEIVE_PINS[0]),
+    CapacitiveSensor(CAP_SEND_PIN, CAP_RECEIVE_PINS[1]),
+    CapacitiveSensor(CAP_SEND_PIN, CAP_RECEIVE_PINS[2])
+};
+
+const uint8_t CAP_SAMPLES = 12;
+const uint8_t TOUCH_CONSECUTIVE_READS = 2;
+const uint8_t RELEASE_CONSECUTIVE_READS = 5;
+const unsigned long READ_INTERVAL_MS = 8;
 const unsigned long DEBUG_PRINT_INTERVAL_MS = 500;
+const unsigned long SENSOR_TIMEOUT_MS = 10;
 
 // Thresholds are relative to baseline (delta = raw - baseline).
 const long TOUCH_DELTA_THRESHOLD = 45;
-const long RELEASE_DELTA_THRESHOLD = 20;
+const long RELEASE_DELTA_THRESHOLD = 26;
 const uint8_t BASELINE_ALPHA_DIV = 16; // Larger = slower baseline tracking
 
-bool isTouched = false;
-uint8_t touchConfidence = 0;
-uint8_t releaseConfidence = 0;
+// Per-yarn touch detection state
+struct YarnState {
+  bool isTouched = false;
+  uint8_t touchConfidence = 0;
+  uint8_t releaseConfidence = 0;
+  long baseline = 0;
+  bool baselineInitialized = false;
+};
+
+YarnState yarnStates[NUM_YARNS];
+long lastRaw[NUM_YARNS] = {0, 0, 0};
+long lastDelta[NUM_YARNS] = {0, 0, 0};
+bool lastReadValid[NUM_YARNS] = {false, false, false};
+unsigned long timeoutCount[NUM_YARNS] = {0, 0, 0};
+
 unsigned long lastReadMs = 0;
 unsigned long lastDebugPrintMs = 0;
-long baseline = 0;
-bool baselineInitialized = false;
 
 void setup() {
   Serial.begin(115200);
-  capSensor.set_CS_AutocaL_Millis(0xFFFFFFFF); // Avoid auto-resetting baseline
+  for (uint8_t i = 0; i < NUM_YARNS; ++i) {
+    capSensors[i].set_CS_AutocaL_Millis(0xFFFFFFFF); // Avoid auto-resetting baseline
+    capSensors[i].set_CS_Timeout_Millis(SENSOR_TIMEOUT_MS);
+  }
 
-  Serial.println("Capacitive touch ready (pins 2 -> 4)");
-  Serial.println("Touch wire on pin 4 to trigger.");
+  Serial.println("Capacitive touch ready (Multi-yarn mode)");
+  for (uint8_t i = 0; i < NUM_YARNS; ++i) {
+    Serial.print("  Yarn ");
+    Serial.print(i + 1);
+    Serial.print(": send pin = ");
+    Serial.print(CAP_SEND_PIN);
+    Serial.print(", receive pin = ");
+    Serial.println(CAP_RECEIVE_PINS[i]);
+  }
+  Serial.println("Touch any yarn wire to trigger detection.");
 }
 
 void loop() {
@@ -41,59 +72,109 @@ void loop() {
   }
   lastReadMs = nowMs;
 
-  long raw = capSensor.capacitiveSensor(CAP_SAMPLES);
-  if (raw < 0) {
-    // Library returns negative on timeout/error.
-    return;
-  }
+  long rawVals[NUM_YARNS] = {0, 0, 0};
+  long deltas[NUM_YARNS] = {0, 0, 0};
+  bool valid[NUM_YARNS] = {false, false, false};
+  bool freezeBaselines = false;
 
-  if (!baselineInitialized) {
-    baseline = raw;
-    baselineInitialized = true;
-  }
-
-  long delta = raw - baseline;
-
-  // Track ambient drift only while released.
-  if (!isTouched) {
-    baseline += (raw - baseline) / BASELINE_ALPHA_DIV;
-  }
-
-  if (!isTouched) {
-    if (delta >= TOUCH_DELTA_THRESHOLD) {
-      touchConfidence++;
-      releaseConfidence = 0;
-      if (touchConfidence >= REQUIRED_CONSECUTIVE_READS) {
-        isTouched = true;
-        touchConfidence = 0;
-        Serial.println("Wire touched");
-      }
-    } else {
-      touchConfidence = 0;
+  // Pass 1: read every yarn first, then decide freeze policy.
+  for (uint8_t i = 0; i < NUM_YARNS; ++i) {
+    long raw = capSensors[i].capacitiveSensor(CAP_SAMPLES);
+    if (raw < 0) {
+      // Library returns negative on timeout/error. Keep previous state.
+      lastReadValid[i] = false;
+      timeoutCount[i]++;
+      continue;
     }
-  } else {
-    if (delta <= RELEASE_DELTA_THRESHOLD) {
-      releaseConfidence++;
-      touchConfidence = 0;
-      if (releaseConfidence >= REQUIRED_CONSECUTIVE_READS) {
-        isTouched = false;
-        releaseConfidence = 0;
-        Serial.println("Wire released");
+
+    valid[i] = true;
+    lastReadValid[i] = true;
+
+    YarnState &state = yarnStates[i];
+    if (!state.baselineInitialized) {
+      state.baseline = raw;
+      state.baselineInitialized = true;
+    }
+
+    rawVals[i] = raw;
+    deltas[i] = raw - state.baseline;
+    lastRaw[i] = raw;
+    lastDelta[i] = deltas[i];
+
+    // Freeze all baselines if any yarn is touched OR clearly rising toward touch.
+    if (state.isTouched || deltas[i] >= TOUCH_DELTA_THRESHOLD) {
+      freezeBaselines = true;
+    }
+  }
+
+  // Pass 2: baseline update and state machine use synchronized frame data.
+  for (uint8_t i = 0; i < NUM_YARNS; ++i) {
+    if (!valid[i]) {
+      continue;
+    }
+
+    YarnState &state = yarnStates[i];
+    long raw = rawVals[i];
+    long delta = deltas[i];
+
+    if (!freezeBaselines && !state.isTouched) {
+      state.baseline += (raw - state.baseline) / BASELINE_ALPHA_DIV;
+      delta = raw - state.baseline;
+      lastDelta[i] = delta;
+    }
+
+    if (!state.isTouched) {
+      if (delta >= TOUCH_DELTA_THRESHOLD) {
+        state.touchConfidence++;
+        state.releaseConfidence = 0;
+        if (state.touchConfidence >= TOUCH_CONSECUTIVE_READS) {
+          state.isTouched = true;
+          state.touchConfidence = 0;
+          Serial.print("Yarn ");
+          Serial.print(i + 1);
+          Serial.println(" touched");
+        }
+      } else {
+        state.touchConfidence = 0;
       }
     } else {
-      releaseConfidence = 0;
+      if (delta <= RELEASE_DELTA_THRESHOLD) {
+        state.releaseConfidence++;
+        state.touchConfidence = 0;
+        if (state.releaseConfidence >= RELEASE_CONSECUTIVE_READS) {
+          state.isTouched = false;
+          state.releaseConfidence = 0;
+          Serial.print("Yarn ");
+          Serial.print(i + 1);
+          Serial.println(" released");
+        }
+      } else {
+        state.releaseConfidence = 0;
+      }
     }
   }
 
   if ((nowMs - lastDebugPrintMs) >= DEBUG_PRINT_INTERVAL_MS) {
     lastDebugPrintMs = nowMs;
-    Serial.print("Raw: ");
-    Serial.print(raw);
-    Serial.print(" | Baseline: ");
-    Serial.print(baseline);
-    Serial.print(" | Delta: ");
-    Serial.print(delta);
-    Serial.print(" | State: ");
-    Serial.println(isTouched ? "TOUCHED" : "RELEASED");
+    for (uint8_t i = 0; i < NUM_YARNS; ++i) {
+      YarnState &state = yarnStates[i];
+      Serial.print("Yarn ");
+      Serial.print(i + 1);
+      if (!lastReadValid[i]) {
+        Serial.print(" | read timeout");
+      } else {
+        Serial.print(" | Raw: ");
+        Serial.print(lastRaw[i]);
+        Serial.print(" | Baseline: ");
+        Serial.print(state.baseline);
+        Serial.print(" | Delta: ");
+        Serial.print(lastDelta[i]);
+      }
+      Serial.print(" | State: ");
+      Serial.print(state.isTouched ? "TOUCHED" : "RELEASED");
+      Serial.print(" | Timeouts: ");
+      Serial.println(timeoutCount[i]);
+    }
+    Serial.println("---");
   }
 }
