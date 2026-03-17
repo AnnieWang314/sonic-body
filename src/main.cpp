@@ -20,13 +20,19 @@ const uint8_t CAP_SAMPLES = 12;
 const uint8_t TOUCH_CONSECUTIVE_READS = 2;
 const uint8_t RELEASE_CONSECUTIVE_READS = 5;
 const unsigned long READ_INTERVAL_MS = 8;
-const unsigned long DEBUG_PRINT_INTERVAL_MS = 500;
 const unsigned long SENSOR_TIMEOUT_MS = 10;
 
 // Thresholds are relative to baseline (delta = raw - baseline).
 const long TOUCH_DELTA_THRESHOLD = 45;
 const long RELEASE_DELTA_THRESHOLD = 26;
 const uint8_t BASELINE_ALPHA_DIV = 16; // Larger = slower baseline tracking
+
+long roundUpToNearest100(long value) {
+  if (value <= 0) {
+    return 0;
+  }
+  return ((value + 99) / 100) * 100;
+}
 
 // Per-yarn touch detection state
 struct YarnState {
@@ -44,7 +50,6 @@ bool lastReadValid[NUM_YARNS] = {false, false, false};
 unsigned long timeoutCount[NUM_YARNS] = {0, 0, 0};
 
 unsigned long lastReadMs = 0;
-unsigned long lastDebugPrintMs = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -52,17 +57,6 @@ void setup() {
     capSensors[i].set_CS_AutocaL_Millis(0xFFFFFFFF); // Avoid auto-resetting baseline
     capSensors[i].set_CS_Timeout_Millis(SENSOR_TIMEOUT_MS);
   }
-
-  Serial.println("Capacitive touch ready (Multi-yarn mode)");
-  for (uint8_t i = 0; i < NUM_YARNS; ++i) {
-    Serial.print("  Yarn ");
-    Serial.print(i + 1);
-    Serial.print(": send pin = ");
-    Serial.print(CAP_SEND_PIN);
-    Serial.print(", receive pin = ");
-    Serial.println(CAP_RECEIVE_PINS[i]);
-  }
-  Serial.println("Touch any yarn wire to trigger detection.");
 }
 
 void loop() {
@@ -130,9 +124,6 @@ void loop() {
         if (state.touchConfidence >= TOUCH_CONSECUTIVE_READS) {
           state.isTouched = true;
           state.touchConfidence = 0;
-          Serial.print("Yarn ");
-          Serial.print(i + 1);
-          Serial.println(" touched");
         }
       } else {
         state.touchConfidence = 0;
@@ -144,9 +135,6 @@ void loop() {
         if (state.releaseConfidence >= RELEASE_CONSECUTIVE_READS) {
           state.isTouched = false;
           state.releaseConfidence = 0;
-          Serial.print("Yarn ");
-          Serial.print(i + 1);
-          Serial.println(" released");
         }
       } else {
         state.releaseConfidence = 0;
@@ -154,27 +142,14 @@ void loop() {
     }
   }
 
-  if ((nowMs - lastDebugPrintMs) >= DEBUG_PRINT_INTERVAL_MS) {
-    lastDebugPrintMs = nowMs;
-    for (uint8_t i = 0; i < NUM_YARNS; ++i) {
-      YarnState &state = yarnStates[i];
-      Serial.print("Yarn ");
-      Serial.print(i + 1);
-      if (!lastReadValid[i]) {
-        Serial.print(" | read timeout");
-      } else {
-        Serial.print(" | Raw: ");
-        Serial.print(lastRaw[i]);
-        Serial.print(" | Baseline: ");
-        Serial.print(state.baseline);
-        Serial.print(" | Delta: ");
-        Serial.print(lastDelta[i]);
-      }
-      Serial.print(" | State: ");
-      Serial.print(state.isTouched ? "TOUCHED" : "RELEASED");
-      Serial.print(" | Timeouts: ");
-      Serial.println(timeoutCount[i]);
-    }
-    Serial.println("---");
-  }
+  long out0 = (lastReadValid[0] && yarnStates[0].isTouched) ? roundUpToNearest100(lastRaw[0]) : 0;
+  long out1 = (lastReadValid[1] && yarnStates[1].isTouched) ? roundUpToNearest100(lastRaw[1]) : 0;
+  long out2 = (lastReadValid[2] && yarnStates[2].isTouched) ? roundUpToNearest100(lastRaw[2]) : 0;
+
+  Serial.print(out0);
+  Serial.print(" ");
+  Serial.print(out1);
+  Serial.print(" ");
+  Serial.print(out2);
+  Serial.println();
 }
