@@ -4,16 +4,19 @@
 // === Multi-yarn Capacitive Touch Setup ===
 // Use ONE shared send pin for all yarn channels.
 // This is the recommended topology for multi-touch with CapacitiveSensor.
-const uint8_t NUM_YARNS = 3;
+const uint8_t NUM_YARNS = 6;
 
 const uint8_t CAP_SEND_PIN = 2;
-const uint8_t CAP_RECEIVE_PINS[NUM_YARNS] = {3, 7, 9};
+const uint8_t CAP_RECEIVE_PINS[NUM_YARNS] = {3, 4, 5, 6, 7, 9};
 
 // Create CapacitiveSensor objects for all yarns (shared send pin).
 CapacitiveSensor capSensors[NUM_YARNS] = {
     CapacitiveSensor(CAP_SEND_PIN, CAP_RECEIVE_PINS[0]),
     CapacitiveSensor(CAP_SEND_PIN, CAP_RECEIVE_PINS[1]),
-    CapacitiveSensor(CAP_SEND_PIN, CAP_RECEIVE_PINS[2])
+    CapacitiveSensor(CAP_SEND_PIN, CAP_RECEIVE_PINS[2]),
+    CapacitiveSensor(CAP_SEND_PIN, CAP_RECEIVE_PINS[3]),
+    CapacitiveSensor(CAP_SEND_PIN, CAP_RECEIVE_PINS[4]),
+    CapacitiveSensor(CAP_SEND_PIN, CAP_RECEIVE_PINS[5])
 };
 
 const uint8_t CAP_SAMPLES = 12;
@@ -23,16 +26,10 @@ const unsigned long READ_INTERVAL_MS = 8;
 const unsigned long SENSOR_TIMEOUT_MS = 10;
 
 // Thresholds are relative to baseline (delta = raw - baseline).
-const long TOUCH_DELTA_THRESHOLD = 45;
-const long RELEASE_DELTA_THRESHOLD = 26;
+const long TOUCH_DELTA_THRESHOLD = 18;
+const long RELEASE_DELTA_THRESHOLD = 10;
 const uint8_t BASELINE_ALPHA_DIV = 16; // Larger = slower baseline tracking
-
-long roundUpToNearest100(long value) {
-  if (value <= 0) {
-    return 0;
-  }
-  return ((value + 99) / 100) * 100;
-}
+const long INVALID_READ_SENTINEL = -9999;
 
 // Per-yarn touch detection state
 struct YarnState {
@@ -44,10 +41,10 @@ struct YarnState {
 };
 
 YarnState yarnStates[NUM_YARNS];
-long lastRaw[NUM_YARNS] = {0, 0, 0};
-long lastDelta[NUM_YARNS] = {0, 0, 0};
-bool lastReadValid[NUM_YARNS] = {false, false, false};
-unsigned long timeoutCount[NUM_YARNS] = {0, 0, 0};
+long lastRaw[NUM_YARNS] = {};
+long lastDelta[NUM_YARNS] = {};
+bool lastReadValid[NUM_YARNS] = {};
+unsigned long timeoutCount[NUM_YARNS] = {};
 
 unsigned long lastReadMs = 0;
 
@@ -66,9 +63,9 @@ void loop() {
   }
   lastReadMs = nowMs;
 
-  long rawVals[NUM_YARNS] = {0, 0, 0};
-  long deltas[NUM_YARNS] = {0, 0, 0};
-  bool valid[NUM_YARNS] = {false, false, false};
+  long rawVals[NUM_YARNS] = {};
+  long deltas[NUM_YARNS] = {};
+  bool valid[NUM_YARNS] = {};
   bool freezeBaselines = false;
 
   // Pass 1: read every yarn first, then decide freeze policy.
@@ -142,14 +139,13 @@ void loop() {
     }
   }
 
-  long out0 = (lastReadValid[0] && yarnStates[0].isTouched) ? roundUpToNearest100(lastRaw[0]) : 0;
-  long out1 = (lastReadValid[1] && yarnStates[1].isTouched) ? roundUpToNearest100(lastRaw[1]) : 0;
-  long out2 = (lastReadValid[2] && yarnStates[2].isTouched) ? roundUpToNearest100(lastRaw[2]) : 0;
-
-  Serial.print(out0);
-  Serial.print(" ");
-  Serial.print(out1);
-  Serial.print(" ");
-  Serial.print(out2);
+  for (uint8_t i = 0; i < NUM_YARNS; ++i) {
+    // Output live delta so tuning/debugging works even before touch latching.
+    long out = lastReadValid[i] ? lastDelta[i] : INVALID_READ_SENTINEL;
+    Serial.print(out);
+    if (i < (NUM_YARNS - 1)) {
+      Serial.print(" ");
+    }
+  }
   Serial.println();
 }
